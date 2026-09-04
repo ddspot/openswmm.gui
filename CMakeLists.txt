@@ -1813,42 +1813,61 @@ if(APPLE)
             "Set QT_ROOT_DIR or add the Qt bin directory to PATH.")
     endif()
 
-    # Bundle the engine's runtime-loaded GPU surface-solver plugin (Kokkos
-    # OpenMP, openswmm_gpu_omp). It is NOT a link-time dependency of SWMMVis —
-    # the engine dlopen()s it at runtime — so macdeployqt does not see it and
-    # never copies it. Place it next to the engine dylib in Contents/Frameworks
-    # (where macdeployqt lands libopenswmm.engine.*.dylib) so the engine's
-    # SurfaceSolverFactory, which resolves its search root via dladdr on the
-    # loaded engine, discovers it and `auto` selects the OpenMP backend. libomp
-    # is the plugin's only non-static, non-system dependency; co-locate it too
-    # (the plugin's @loader_path RPATH then resolves it — and the engine itself
-    # also needs it). The codesign step below re-signs the bundle including
-    # these added dylibs. Source paths come from the prebuilt engine package
-    # (OPENSWMMENGINE_INSTALL_DIR, set in cmake/FetchOpenSWMMEngine.cmake).
+    # Bundle libomp — a link-time dependency of BOTH engine dylibs
+    # (libopenswmm.engine and libopenswmm.legacy.engine each declare
+    # @rpath/libomp.dylib), so it is required regardless of whether the optional
+    # GPU plugin is present. Place it in Contents/Frameworks (where macdeployqt
+    # lands libopenswmm.engine.*.dylib) so the engine's @rpath resolves it.
+    # Source paths come from the prebuilt engine package (OPENSWMMENGINE_INSTALL_DIR,
+    # set in cmake/FetchOpenSWMMEngine.cmake).
     set(_swmmvis_frameworks "$<TARGET_BUNDLE_DIR:SWMMVis>/Contents/Frameworks")
     add_custom_command(TARGET SWMMVis POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_swmmvis_frameworks}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${OPENSWMMENGINE_INSTALL_DIR}/lib/libopenswmm_gpu_omp.dylib"
-                "${_swmmvis_frameworks}/"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${OPENSWMMENGINE_INSTALL_DIR}/bin/libomp.dylib"
                 "${_swmmvis_frameworks}/"
-        # The plugin links Homebrew's libomp by ABSOLUTE path. Left as-is the
-        # process loads TWO libomp runtimes (bundle copy via the engine +
-        # Homebrew copy via the plugin) and libomp aborts the app on its
-        # duplicate-runtime check the moment a big-mesh run loads the plugin.
-        # Rewrite the bundled copy to the bundled libomp; each -change is a
-        # no-op when that source path isn't present (Apple Silicon vs Intel).
-        COMMAND install_name_tool
-                -change /opt/homebrew/opt/libomp/lib/libomp.dylib
-                        @executable_path/../Frameworks/libomp.dylib
-                -change /usr/local/opt/libomp/lib/libomp.dylib
-                        @executable_path/../Frameworks/libomp.dylib
-                "${_swmmvis_frameworks}/libopenswmm_gpu_omp.dylib"
-        COMMENT "Bundle GPU plugin (openswmm_gpu_omp) + libomp into SWMMVis.app/Contents/Frameworks"
+        COMMENT "Bundle libomp into SWMMVis.app/Contents/Frameworks"
         VERBATIM
     )
+
+    # Bundle the engine's runtime-loaded GPU surface-solver plugin (Kokkos
+    # OpenMP, openswmm_gpu_omp). It is NOT a link-time dependency of SWMMVis —
+    # the engine dlopen()s it at runtime — so macdeployqt does not see it and
+    # never copies it. Place it next to the engine dylib in Contents/Frameworks
+    # so the engine's SurfaceSolverFactory, which resolves its search root via
+    # dladdr on the loaded engine, discovers it and `auto` selects the OpenMP
+    # backend. The plugin is OPTIONAL: it is only produced when the engine is
+    # built with the GPU/Kokkos-OpenMP feature. When the engine is built without
+    # it (e.g. the Kokkos vcpkg port is unavailable on arm64-osx), the source
+    # dylib does not exist — guard the copy with EXISTS (mirroring the
+    # legacy-worker / openswmm-CLI blocks below) so a GPU-less engine does not
+    # fail the GUI build; the engine then falls back to the CPU surface solver.
+    set(_gpu_omp_plugin "${OPENSWMMENGINE_INSTALL_DIR}/lib/libopenswmm_gpu_omp.dylib")
+    if(EXISTS "${_gpu_omp_plugin}")
+        add_custom_command(TARGET SWMMVis POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_gpu_omp_plugin}" "${_swmmvis_frameworks}/"
+            # The plugin links Homebrew's libomp by ABSOLUTE path. Left as-is the
+            # process loads TWO libomp runtimes (bundle copy via the engine +
+            # Homebrew copy via the plugin) and libomp aborts the app on its
+            # duplicate-runtime check the moment a big-mesh run loads the plugin.
+            # Rewrite the bundled copy to the bundled libomp; each -change is a
+            # no-op when that source path isn't present (Apple Silicon vs Intel).
+            COMMAND install_name_tool
+                    -change /opt/homebrew/opt/libomp/lib/libomp.dylib
+                            @executable_path/../Frameworks/libomp.dylib
+                    -change /usr/local/opt/libomp/lib/libomp.dylib
+                            @executable_path/../Frameworks/libomp.dylib
+                    "${_swmmvis_frameworks}/libopenswmm_gpu_omp.dylib"
+            COMMENT "Bundle GPU plugin (openswmm_gpu_omp) into SWMMVis.app/Contents/Frameworks"
+            VERBATIM
+        )
+    else()
+        message(WARNING
+            "GPU plugin not found at ${_gpu_omp_plugin} — the engine was built "
+            "without the GPU/Kokkos-OpenMP surface solver, so the GUI will use "
+            "the CPU solver. Rebuild the engine with the GPU feature to enable it.")
+    endif()
 
     # Ad-hoc re-sign after every build. Without this, when CMake
     # rebuilds a dependent dylib (engine, QPropertyModel, …) macOS's
